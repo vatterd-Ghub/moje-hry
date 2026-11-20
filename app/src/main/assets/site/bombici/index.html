@@ -1,0 +1,658 @@
+<!doctype html>
+<html lang="cs"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bombíci</title>
+<style>
+/* One fixed look: dark arena, cyan vs. red players. Canvas scaled to fit the screen (TV 16:9 friendly). */
+:root { --bg: #0a1017; --ink: #e8eef6; --muted: #8ea0b5; color-scheme: dark; }
+html, body { height: 100%; }
+body {
+  margin: 0; box-sizing: border-box; background: var(--bg); color: var(--ink);
+  font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 8px 16px;
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+canvas { display: block; outline: none; background: #0f1823; border-radius: 6px; }
+#msg { position: fixed; left: 0; right: 0; top: 0; padding: 12px 16px; font: 20px/1.4 sans-serif; color: #ffd23f; background: #1a2430; z-index: 5; white-space: pre-wrap; }
+</style>
+</head><body>
+<div id="msg">Načítám hru Bombíci…
+Pokud tento text zůstane, nepodařilo se spustit JavaScript.</div>
+<script>window.onerror=function(m,u,l,c){var e=document.getElementById("msg");if(e){e.textContent="Chyba: "+m+" (řádek "+l+")";}};</script>
+<canvas id="c" tabindex="0" aria-label="Hra Bombíci pro dva hráče"></canvas>
+<script>
+(function () {
+'use strict';
+var COLS = 15, ROWS = 13, T = 64, HUD = 72, LW = COLS * T, LH = ROWS * T + HUD;
+var WIN_TARGET = 3, FUSE = 2.2, FLAME_T = 0.55, SUDDEN_AT = 75, SUDDEN_STEP = 0.26;
+var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+var scale = 1, dpr = 1;
+var STACK_FONT = '"Trebuchet MS", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+function fit() {
+  var cs = getComputedStyle(document.body);
+  var w = (window.innerWidth || document.documentElement.clientWidth || 1280) - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+  var h = (window.innerHeight || document.documentElement.clientHeight || 720) - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+  scale = Math.max(0.2, Math.min(w / LW, h / LH));
+  dpr = window.devicePixelRatio || 1;
+  cv.style.width = Math.floor(LW * scale) + 'px';
+  cv.style.height = Math.floor(LH * scale) + 'px';
+  cv.width = Math.floor(LW * scale * dpr);
+  cv.height = Math.floor(LH * scale * dpr);
+}
+window.addEventListener('resize', fit);
+
+/* ---------- audio ---------- */
+var AC = null, muted = false;
+function audio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  if (AC && AC.state === 'suspended') { try { AC.resume(); } catch (e) {} }
+  return AC;
+}
+function tone(f, d, type, v, slide) {
+  if (muted) return; var a = audio(); if (!a) return;
+  try {
+    var o = a.createOscillator(), g = a.createGain(), t0 = a.currentTime;
+    o.type = type || 'square'; o.frequency.setValueAtTime(f, t0);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, slide), t0 + d);
+    g.gain.setValueAtTime(v || 0.06, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(t0 + d);
+  } catch (e) {}
+}
+function boom() {
+  if (muted) return; var a = audio(); if (!a) return;
+  try {
+    var len = Math.floor(a.sampleRate * 0.45), buf = a.createBuffer(1, len, a.sampleRate), d = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2);
+    var s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+    s.buffer = buf; f.type = 'lowpass'; f.frequency.value = 900; g.gain.value = 0.35;
+    s.connect(f); f.connect(g); g.connect(a.destination); s.start();
+  } catch (e) {}
+}
+
+/* ---------- state ---------- */
+var state = 'menu';          // menu | play | round | match
+var grid, items, hidden, bombs, flames, players, spiral;
+var time = 0, roundTime = 0, intro = 0, endTimer = 0, sdAcc = 0, sdIdx = 0, lastWinner = null, lockUntil = 0;
+var mode = 'single', menuSel = 0, menuStage = 0, diff = 'medium';
+var DIFF = {
+  easy:   { label: 'LEHKÝ',   wait: [0.28, 0.30], react: 0.5,  line: 0.45, near: 0,   brick: 0.5,  wander: 0.12, chase: 0.55, cd: 1.0, spd: 3.8, esc: 5, item: 4, hunt: 0 },
+  medium: { label: 'STŘEDNÍ', wait: [0.05, 0.08], react: 0.12, line: 1,    near: 0.5, brick: 0.35, wander: 0.05, chase: 1,    cd: 0.5, spd: 4.5, esc: 6, item: 7, hunt: 0.7 },
+  hard:   { label: 'TĚŽKÝ',   wait: [0, 0.03],    react: 0,    line: 1,    near: 0.9, brick: 0.2,  wander: 0.02, chase: 1,    cd: 0.3, spd: 5.2, esc: 7, item: 10, hunt: 1.6 }
+};
+var DIFF_KEYS = ['easy', 'medium', 'hard'];
+function menuCount() { return menuStage === 0 ? 2 : 4; }
+function menuMove(d) { menuSel = Math.max(0, Math.min(menuCount() - 1, menuSel + d)); tone(440, 0.05, 'square', 0.04); }
+function menuRect(i) { if (menuStage === 0) return { y: 240 + i * 96, h: 76 }; return i < 3 ? { y: 200 + i * 96, h: 76 } : { y: 496, h: 56 }; }
+function menuBack() { menuStage = 0; menuSel = 0; }
+var DIRS = { u: [0, -1], d: [0, 1], l: [-1, 0], r: [1, 0] };
+
+function makeSpiral() {
+  var res = [], x0 = 1, y0 = 1, x1 = COLS - 2, y1 = ROWS - 2, x, y;
+  while (x0 <= x1 && y0 <= y1) {
+    for (x = x0; x <= x1; x++) res.push([x, y0]);
+    for (y = y0 + 1; y <= y1; y++) res.push([x1, y]);
+    if (y0 < y1) for (x = x1 - 1; x >= x0; x--) res.push([x, y1]);
+    if (x0 < x1) for (y = y1 - 1; y > y0; y--) res.push([x0, y]);
+    x0++; y0++; x1--; y1--;
+  }
+  return res;
+}
+function mkPlayer(id, gx, gy, color, light) {
+  return { id: id, gx: gx, gy: gy, x: gx, y: gy, mv: null, face: 'd', alive: true,
+    maxBombs: 1, active: 0, range: 2, speed: 4.5, color: color, light: light,
+    wins: players ? players[id].wins : 0, input: { dx: 0, dy: 0 }, bombReq: false };
+}
+function newRound() {
+  var x, y, r;
+  grid = []; items = []; hidden = [];
+  for (y = 0; y < ROWS; y++) {
+    grid.push([]); items.push([]); hidden.push([]);
+    for (x = 0; x < COLS; x++) {
+      var wall = (x === 0 || y === 0 || x === COLS - 1 || y === ROWS - 1 || (x % 2 === 0 && y % 2 === 0));
+      grid[y][x] = wall ? 1 : (Math.random() < 0.72 ? 2 : 0);
+      items[y][x] = null; hidden[y][x] = null;
+    }
+  }
+  [[1, 1], [2, 1], [1, 2], [COLS - 2, ROWS - 2], [COLS - 3, ROWS - 2], [COLS - 2, ROWS - 3]].forEach(function (c) { grid[c[1]][c[0]] = 0; });
+  for (y = 0; y < ROWS; y++) for (x = 0; x < COLS; x++) {
+    if (grid[y][x] === 2 && Math.random() < 0.3) {
+      r = Math.random(); hidden[y][x] = r < 0.38 ? 'B' : (r < 0.8 ? 'D' : 'R');
+    }
+  }
+  var prev = players;
+  if (!prev) players = [{ wins: 0 }, { wins: 0 }];
+  var w0 = players[0].wins, w1 = players[1].wins;
+  players = [{ wins: w0 }, { wins: w1 }];
+  var p1 = mkPlayer(0, 1, 1, '#35c8ff', '#b7ecff'), p2 = mkPlayer(1, COLS - 2, ROWS - 2, '#ff5d73', '#ffc1ca');
+  p1.wins = w0; p2.wins = w1; if (mode === 'single') p2.speed = DIFF[diff].spd; players = [p1, p2];
+  bombs = []; flames = []; spiral = makeSpiral();
+  roundTime = 0; sdAcc = 0; sdIdx = 0; endTimer = 0; intro = 1.8; lastWinner = null;
+}
+function startMatch() { players = null; newRound(); players[0].wins = 0; players[1].wins = 0; state = 'play'; }
+
+/* ---------- rules ---------- */
+function bombAt(x, y) { for (var i = 0; i < bombs.length; i++) if (bombs[i].x === x && bombs[i].y === y) return bombs[i]; return null; }
+function flameAt(x, y) { for (var i = 0; i < flames.length; i++) if (flames[i].x === x && flames[i].y === y) return true; return false; }
+function canEnter(p, x, y) {
+  if (x < 0 || y < 0 || x >= COLS || y >= ROWS) return false;
+  if (grid[y][x] !== 0) return false;
+  var b = bombAt(x, y);
+  if (b && b.pass.indexOf(p) < 0) return false;
+  return true;
+}
+function pickup(p) {
+  var it = items[p.gy][p.gx]; if (!it) return;
+  items[p.gy][p.gx] = null;
+  if (it === 'B') p.maxBombs = Math.min(6, p.maxBombs + 1);
+  if (it === 'D') p.range = Math.min(8, p.range + 1);
+  if (it === 'R') p.speed = Math.min(8.2, p.speed + 0.9);
+  tone(520, 0.12, 'triangle', 0.08, 1040);
+}
+function stepPlayer(p, dt) {
+  var d = p.input, budget = dt * p.speed, guard = 0;
+  if (d.dx || d.dy) p.face = d.dx < 0 ? 'l' : d.dx > 0 ? 'r' : d.dy < 0 ? 'u' : 'd';
+  if (p.mv && (d.dx || d.dy)) { // reverse mid-step
+    var mx = p.mv.tx - p.mv.fx, my = p.mv.ty - p.mv.fy;
+    if (d.dx === -mx && d.dy === -my && (mx || my)) {
+      var f = p.mv; p.mv = { fx: f.tx, fy: f.ty, tx: f.fx, ty: f.fy, t: 1 - f.t };
+      p.gx = f.tx; p.gy = f.ty;
+    }
+  }
+  while (budget > 0 && guard++ < 4) {
+    if (!p.mv) {
+      if (!(d.dx || d.dy)) break;
+      var nx = p.gx + d.dx, ny = p.gy + d.dy;
+      if (!canEnter(p, nx, ny)) break;
+      p.mv = { fx: p.gx, fy: p.gy, tx: nx, ty: ny, t: 0 };
+    }
+    var need = 1 - p.mv.t;
+    if (budget >= need) { budget -= need; p.gx = p.mv.tx; p.gy = p.mv.ty; p.mv = null; pickup(p); }
+    else { p.mv.t += budget; budget = 0; }
+  }
+  if (p.mv) { p.x = p.mv.fx + (p.mv.tx - p.mv.fx) * p.mv.t; p.y = p.mv.fy + (p.mv.ty - p.mv.fy) * p.mv.t; }
+  else { p.x = p.gx; p.y = p.gy; }
+}
+function placeBomb(p) {
+  var tx = Math.round(p.x), ty = Math.round(p.y);
+  if (p.active >= p.maxBombs || grid[ty][tx] !== 0 || bombAt(tx, ty)) return;
+  var pass = players.filter(function (q) { return q.alive && Math.round(q.x) === tx && Math.round(q.y) === ty; });
+  bombs.push({ x: tx, y: ty, t: FUSE, owner: p, range: p.range, pass: pass, dead: false });
+  p.active++; tone(180, 0.12, 'square', 0.07, 90);
+}
+function explode(b) {
+  if (b.dead) return; b.dead = true;
+  bombs.splice(bombs.indexOf(b), 1); b.owner.active = Math.max(0, b.owner.active - 1);
+  var chain = [];
+  flames.push({ x: b.x, y: b.y, t: FLAME_T });
+  Object.keys(DIRS).forEach(function (k) {
+    var d = DIRS[k];
+    for (var i = 1; i <= b.range; i++) {
+      var x = b.x + d[0] * i, y = b.y + d[1] * i;
+      if (grid[y][x] === 1) break;
+      flames.push({ x: x, y: y, t: FLAME_T });
+      if (grid[y][x] === 2) { grid[y][x] = 0; items[y][x] = hidden[y][x]; hidden[y][x] = null; break; }
+      if (items[y][x]) { items[y][x] = null; break; }
+      var ob = bombAt(x, y); if (ob) { chain.push(ob); break; }
+    }
+  });
+  boom();
+  chain.forEach(explode);
+}
+function closeCell(c) {
+  var x = c[0], y = c[1];
+  if (grid[y][x] === 1) return;
+  grid[y][x] = 1; items[y][x] = null; hidden[y][x] = null;
+  var b = bombAt(x, y); if (b) { b.dead = true; bombs.splice(bombs.indexOf(b), 1); b.owner.active = Math.max(0, b.owner.active - 1); }
+  flames = flames.filter(function (f) { return !(f.x === x && f.y === y); });
+  tone(110, 0.15, 'sawtooth', 0.05, 60);
+}
+function kill(p) { if (!p.alive) return; p.alive = false; tone(300, 0.5, 'sawtooth', 0.09, 50); }
+
+function update(dt) {
+  time += dt;
+  if (state !== 'play') return;
+  if (intro > 0) { intro -= dt; players.forEach(function (p) { p.bombReq = false; }); return; }
+  roundTime += dt;
+  if (mode === 'single' && players[1].alive) aiControl(players[1], dt);
+  players.forEach(function (p) { if (p.alive) stepPlayer(p, dt); });
+  players.forEach(function (p) { if (p.alive && p.bombReq) placeBomb(p); p.bombReq = false; });
+  bombs.slice().forEach(function (b) { if (b.dead) return; b.t -= dt; if (b.t <= 0) explode(b); });
+  bombs.forEach(function (b) {
+    b.pass = b.pass.filter(function (q) { return q.alive && Math.round(q.x) === b.x && Math.round(q.y) === b.y; });
+  });
+  flames = flames.filter(function (f) { f.t -= dt; return f.t > 0; });
+  if (roundTime > SUDDEN_AT) {
+    sdAcc += dt;
+    while (sdAcc >= SUDDEN_STEP && sdIdx < spiral.length) { sdAcc -= SUDDEN_STEP; closeCell(spiral[sdIdx++]); }
+  }
+  players.forEach(function (p) {
+    if (!p.alive) return;
+    var tx = Math.round(p.x), ty = Math.round(p.y);
+    if (flameAt(tx, ty) || grid[ty][tx] === 1) kill(p);
+  });
+  var alive = players.filter(function (p) { return p.alive; });
+  if (alive.length <= 1 && !endTimer) endTimer = 1.3;
+  if (endTimer) {
+    endTimer -= dt;
+    if (endTimer <= 0) {
+      endTimer = 0;
+      var al = players.filter(function (p) { return p.alive; });
+      lastWinner = al.length === 1 ? al[0] : null;
+      if (lastWinner) lastWinner.wins++;
+      state = (lastWinner && lastWinner.wins >= WIN_TARGET) ? 'match' : 'round';
+      lockUntil = performance.now() + 800;
+      if (lastWinner) { [523, 659, 784, 1046].forEach(function (f, i) { setTimeout(function () { tone(f, 0.18, 'triangle', 0.08); }, i * 110); }); }
+    }
+  }
+}
+
+/* ---------- computer opponent ---------- */
+function markBlast(dm, bx, by, range) {
+  dm[by][bx] = true;
+  Object.keys(DIRS).forEach(function (k) {
+    var d = DIRS[k];
+    for (var i = 1; i <= range; i++) {
+      var x = bx + d[0] * i, y = by + d[1] * i;
+      if (grid[y][x] === 1) break;
+      dm[y][x] = true;
+      if (grid[y][x] === 2) break;
+    }
+  });
+}
+function dangerMap() {
+  var dm = [], x, y;
+  for (y = 0; y < ROWS; y++) { dm.push([]); for (x = 0; x < COLS; x++) dm[y].push(flameAt(x, y)); }
+  bombs.forEach(function (b) { markBlast(dm, b.x, b.y, b.range); });
+  return dm;
+}
+function bfs(p, goal, blocked) {
+  var sx = p.gx, sy = p.gy, start = sy * COLS + sx, prev = {}, seen = {}, q = [[sx, sy]], keys = Object.keys(DIRS);
+  seen[start] = true;
+  while (q.length) {
+    var c = q.shift(), x = c[0], y = c[1], k;
+    if ((x !== sx || y !== sy) && goal(x, y)) {
+      var path = [], cur = y * COLS + x;
+      while (cur !== start) { path.unshift([cur % COLS, Math.floor(cur / COLS)]); cur = prev[cur]; }
+      return path;
+    }
+    for (k = 0; k < keys.length; k++) {
+      var d = DIRS[keys[k]], nx = x + d[0], ny = y + d[1], nk = ny * COLS + nx;
+      if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS || seen[nk]) continue;
+      if (grid[ny][nx] !== 0) continue;
+      var b = bombAt(nx, ny); if (b && b.pass.indexOf(p) < 0) continue;
+      if (blocked(nx, ny)) continue;
+      seen[nk] = true; prev[nk] = y * COLS + x; q.push([nx, ny]);
+    }
+  }
+  return null;
+}
+function reach(p, blocked) {
+  var start = p.gy * COLS + p.gx, dist = {}, prev = {}, q = [start], keys = Object.keys(DIRS);
+  dist[start] = 0;
+  while (q.length) {
+    var cur = q.shift(), x = cur % COLS, y = Math.floor(cur / COLS);
+    for (var k = 0; k < keys.length; k++) {
+      var d = DIRS[keys[k]], nx = x + d[0], ny = y + d[1], nk = ny * COLS + nx;
+      if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS || dist[nk] !== undefined) continue;
+      if (grid[ny][nx] !== 0) continue;
+      var b = bombAt(nx, ny); if (b && b.pass.indexOf(p) < 0) continue;
+      if (blocked(nx, ny)) continue;
+      dist[nk] = dist[cur] + 1; prev[nk] = cur; q.push(nk);
+    }
+  }
+  return { dist: dist, prev: prev, start: start };
+}
+function firstStep(R, key) { var cur = key; while (R.prev[cur] !== R.start) cur = R.prev[cur]; return [cur % COLS, Math.floor(cur / COLS)]; }
+function dirTo(p, cell) { return { dx: cell[0] - p.gx, dy: cell[1] - p.gy }; }
+function brickNear(x, y) {
+  var keys = Object.keys(DIRS);
+  for (var k = 0; k < keys.length; k++) { var d = DIRS[keys[k]]; if (grid[y + d[1]][x + d[0]] === 2) return true; }
+  return false;
+}
+function aiWantsBomb(p, e, hasEnemyPath, P) {
+  if (e.alive) {
+    var ex = Math.round(e.x), ey = Math.round(e.y), dist = Math.abs(ex - p.gx) + Math.abs(ey - p.gy);
+    if ((ex === p.gx || ey === p.gy) && dist <= p.range) {
+      var sx = ex > p.gx ? 1 : ex < p.gx ? -1 : 0, sy = ey > p.gy ? 1 : ey < p.gy ? -1 : 0, x = p.gx, y = p.gy, clear = true;
+      while (x !== ex || y !== ey) { x += sx; y += sy; if (grid[y][x] !== 0) { clear = false; break; } }
+      if (clear && Math.random() < P.line) return true;
+    }
+    if (dist <= 2 && Math.random() < P.near) return true;
+  }
+  if (brickNear(p.gx, p.gy) && (!hasEnemyPath || Math.random() < P.brick)) return true;
+  return false;
+}
+function aiControl(p, dt) {
+  var none = { dx: 0, dy: 0 }, e = players[0], path, i, P = DIFF[diff];
+  if (p.mv) { p.input = none; return; }
+  p.aiCd = Math.max(0, (p.aiCd || 0) - dt);
+  var dm = dangerMap();
+  if (dm[p.gy][p.gx]) { // run out of the blast zone (after a reaction delay)
+    p.panic = (p.panic || 0) + dt;
+    if (p.panic < P.react) { p.input = none; return; }
+    path = bfs(p, function (x, y) { return !dm[y][x]; }, function (x, y) { return flameAt(x, y); });
+    p.input = path ? dirTo(p, path[0]) : none; return;
+  }
+  p.panic = 0;
+  p.aiWait = (p.aiWait || 0) - dt;
+  if (p.aiWait > 0) { p.input = none; return; }
+  p.aiWait = P.wait[0] + Math.random() * P.wait[1];
+  var blocked = function (x, y) { return dm[y][x]; };
+  var enemyPath = null;
+  if (e.alive) {
+    var ex = Math.round(e.x), ey = Math.round(e.y);
+    enemyPath = bfs(p, function (x, y) { return x === ex && y === ey; }, blocked);
+  }
+  if (p.aiCd <= 0 && p.active < p.maxBombs && !bombAt(p.gx, p.gy) && aiWantsBomb(p, e, !!enemyPath, P)) {
+    var hyp = [], x2, y2;
+    for (y2 = 0; y2 < ROWS; y2++) { hyp.push([]); for (x2 = 0; x2 < COLS; x2++) hyp[y2].push(dm[y2][x2]); }
+    markBlast(hyp, p.gx, p.gy, p.range);
+    var esc = bfs(p, function (x, y) { return !hyp[y][x]; }, blocked);
+    if (esc && esc.length <= P.esc) { p.bombReq = true; p.aiCd = P.cd; p.input = dirTo(p, esc[0]); return; }
+  }
+  if (Math.random() < P.wander) { // small random wander
+    var keys = Object.keys(DIRS), opts = [];
+    for (i = 0; i < keys.length; i++) {
+      var d = DIRS[keys[i]], nx = p.gx + d[0], ny = p.gy + d[1];
+      if (grid[ny][nx] === 0 && !bombAt(nx, ny) && !dm[ny][nx]) opts.push({ dx: d[0], dy: d[1] });
+    }
+    if (opts.length) { p.input = opts[Math.floor(Math.random() * opts.length)]; return; }
+  }
+  path = bfs(p, function (x, y) { return !!items[y][x]; }, blocked);
+  if (path && path.length <= P.item) { p.input = dirTo(p, path[0]); return; }
+  if (enemyPath && enemyPath.length > 2 && Math.random() < P.chase) { p.input = dirTo(p, enemyPath[0]); return; }
+  if ((!enemyPath || enemyPath.length > 2) && p.active < p.maxBombs) {
+    // pick a brick spot, preferring ones on the side of the opponent
+    var R = reach(p, blocked), best = -1, bestScore = 1e9, cx = e.alive ? Math.round(e.x) : 7, cy = e.alive ? Math.round(e.y) : 6;
+    for (var key in R.dist) {
+      key = +key; if (key === R.start) continue;
+      var kx = key % COLS, ky = Math.floor(key / COLS);
+      if (!dm[ky][kx] && brickNear(kx, ky)) {
+        var sc = R.dist[key] + P.hunt * (Math.abs(kx - cx) + Math.abs(ky - cy));
+        if (sc < bestScore) { bestScore = sc; best = key; }
+      }
+    }
+    if (best >= 0) { p.input = dirTo(p, firstStep(R, best)); return; }
+  }
+  p.input = none;
+}
+function pnameShort(i) { return mode === 'single' && i === 1 ? 'Počítač' : 'Hráč ' + (i + 1); }
+function pname(i) { return mode === 'single' && i === 1 ? 'POČÍTAČ · ' + DIFF[diff].label : pnameShort(i).toUpperCase(); }
+
+/* ---------- input ---------- */
+var KEYDIR = {
+  KeyW: [0, 'u'], KeyA: [0, 'l'], KeyS: [0, 'd'], KeyD: [0, 'r'],
+  ArrowUp: [1, 'u'], ArrowLeft: [1, 'l'], ArrowDown: [1, 'd'], ArrowRight: [1, 'r']
+};
+var KEYBOMB = { Space: 0, Enter: 1, NumpadEnter: 1 };
+var held = [[], []], padPrev = {};
+function advance() {
+  if (performance.now() < lockUntil) return;
+  audio();
+  if (state === 'menu') {
+    if (menuStage === 0) {
+      if (menuSel === 1) { mode = 'multi'; startMatch(); }
+      else { menuStage = 1; menuSel = 1; lockUntil = performance.now() + 150; }
+    } else if (menuSel === 3) { menuBack(); lockUntil = performance.now() + 150; }
+    else { mode = 'single'; diff = DIFF_KEYS[menuSel]; startMatch(); }
+  }
+  else if (state === 'match') { state = 'menu'; menuStage = 0; menuSel = 0; lockUntil = performance.now() + 300; }
+  else if (state === 'round') { newRound(); state = 'play'; }
+}
+function toggleSound() { muted = !muted; if (!muted) tone(660, 0.12, 'triangle', 0.08); }
+window.addEventListener('keydown', function (e) {
+  var k = e.code, ch = (e.key || '').toLowerCase();
+  if (ch === 'z') { e.preventDefault(); if (!e.repeat) toggleSound(); return; }
+  if (KEYDIR[k] || KEYBOMB[k] !== undefined || k === 'KeyF') e.preventDefault();
+  if (k === 'KeyF') { try { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen(); } catch (x) {} return; }
+  if (e.repeat) return;
+  var confirmKey = (k === 'Enter' || k === 'NumpadEnter' || k === 'Space');
+  if (state === 'menu') {
+    if (k === 'ArrowUp' || k === 'KeyW') menuMove(-1);
+    else if (k === 'ArrowDown' || k === 'KeyS') menuMove(1);
+    else if (confirmKey) advance();
+    else if ((k === 'Escape' || k === 'Backspace') && menuStage === 1) menuBack();
+    return;
+  }
+  if (state !== 'play') {
+    if (confirmKey) advance();
+    else if (k === 'Escape' || k === 'Backspace') { state = 'menu'; menuStage = 0; menuSel = 0; lockUntil = performance.now() + 300; }
+    return;
+  }
+  if (KEYDIR[k]) { var m = KEYDIR[k], s = held[m[0]]; if (s.indexOf(m[1]) < 0) s.push(m[1]); }
+  if (KEYBOMB[k] !== undefined && players) players[mode === 'single' ? 0 : KEYBOMB[k]].bombReq = true;
+});
+window.addEventListener('keyup', function (e) {
+  var m = KEYDIR[e.code]; if (!m) return;
+  var s = held[m[0]], i = s.indexOf(m[1]); if (i > -1) s.splice(i, 1);
+});
+window.addEventListener('blur', function () { held = [[], []]; });
+cv.addEventListener('pointerdown', function (ev) {
+  try { window.focus(); cv.focus(); } catch (e) {}
+  if (state === 'menu') {
+    var r = cv.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * LW, py = (ev.clientY - r.top) / r.height * LH - HUD;
+    for (var i = 0; i < menuCount(); i++) {
+      var rc = menuRect(i);
+      if (px > LW / 2 - 280 && px < LW / 2 + 280 && py > rc.y && py < rc.y + rc.h) { menuSel = i; advance(); return; }
+    }
+    return;
+  }
+  advance();
+});
+
+function pads() {
+  var out = [];
+  try { var l = navigator.getGamepads ? navigator.getGamepads() : []; for (var i = 0; i < l.length; i++) if (l[i] && l[i].connected && !/consumer control|touchpad|keyboard|mouse|remote|system control/i.test(l[i].id || '')) out.push(l[i]); } catch (e) {}
+  return out;
+}
+var padDirPrev = {};
+function readInput() {
+  var ps = pads(), i, j;
+  for (i = 0; i < ps.length && i < 2; i++) {
+    var gm = ps[i], ay0 = gm.axes[1] || 0, bt = gm.buttons;
+    var up = ay0 < -0.5 || !!(bt[12] && bt[12].pressed), dn = ay0 > 0.5 || !!(bt[13] && bt[13].pressed);
+    if (state === 'menu') {
+      if (up && !padDirPrev['u' + i]) menuMove(-1);
+      if (dn && !padDirPrev['d' + i]) menuMove(1);
+    }
+    padDirPrev['u' + i] = up; padDirPrev['d' + i] = dn;
+  }
+  var count = mode === 'single' ? 1 : 2;
+  for (i = 0; i < count; i++) {
+    var dx = 0, dy = 0, s = held[i];
+    if (mode === 'single' && !s.length) s = held[1];
+    if (s.length) { var d = DIRS[s[s.length - 1]]; dx = d[0]; dy = d[1]; }
+    var g = ps[i];
+    if (g) {
+      var ax = g.axes[0] || 0, ay = g.axes[1] || 0, gx = 0, gy = 0, b = g.buttons;
+      if (Math.abs(ax) > 0.5 || Math.abs(ay) > 0.5) { if (Math.abs(ax) > Math.abs(ay)) gx = ax > 0 ? 1 : -1; else gy = ay > 0 ? 1 : -1; }
+      if (b[12] && b[12].pressed) { gx = 0; gy = -1; } else if (b[13] && b[13].pressed) { gx = 0; gy = 1; }
+      else if (b[14] && b[14].pressed) { gx = -1; gy = 0; } else if (b[15] && b[15].pressed) { gx = 1; gy = 0; }
+      if (gx || gy) { dx = gx; dy = gy; }
+      for (j = 0; j < Math.min(b.length, 10); j++) {
+        var key = i + '_' + j, now = !!b[j].pressed;
+        if (now && !padPrev[key]) {
+          if (state !== 'play') advance();
+          else if (j <= 3 && players) players[i].bombReq = true;
+        }
+        padPrev[key] = now;
+      }
+    }
+    if (players && players[i]) players[i].input = { dx: dx, dy: dy };
+  }
+}
+
+/* ---------- drawing ---------- */
+function rr(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function drawWall(px, py) {
+  ctx.fillStyle = '#56657a'; ctx.fillRect(px, py, T, T);
+  ctx.fillStyle = '#7e8ea6'; ctx.fillRect(px, py, T, 7); ctx.fillRect(px, py, 7, T);
+  ctx.fillStyle = '#3b4859'; ctx.fillRect(px, py + T - 7, T, 7); ctx.fillRect(px + T - 7, py, 7, T);
+  ctx.fillStyle = '#617189'; ctx.fillRect(px + 14, py + 14, T - 28, T - 28);
+}
+function drawBrick(px, py) {
+  ctx.fillStyle = '#b9602f'; ctx.fillRect(px + 2, py + 2, T - 4, T - 4);
+  ctx.strokeStyle = '#7a3a1b'; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(px + 2, py + T / 3); ctx.lineTo(px + T - 2, py + T / 3);
+  ctx.moveTo(px + 2, py + 2 * T / 3); ctx.lineTo(px + T - 2, py + 2 * T / 3);
+  ctx.moveTo(px + T / 2, py + 2); ctx.lineTo(px + T / 2, py + T / 3);
+  ctx.moveTo(px + T / 4, py + T / 3); ctx.lineTo(px + T / 4, py + 2 * T / 3);
+  ctx.moveTo(px + 3 * T / 4, py + T / 3); ctx.lineTo(px + 3 * T / 4, py + 2 * T / 3);
+  ctx.moveTo(px + T / 2, py + 2 * T / 3); ctx.lineTo(px + T / 2, py + T - 2);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,.12)'; ctx.fillRect(px + 2, py + 2, T - 4, 4);
+}
+var ITEMCOL = { B: '#4aa8ff', D: '#ff8a3d', R: '#4fe08a' };
+function drawItem(px, py, it) {
+  var cx = px + T / 2, cy = py + T / 2, bob = Math.sin(time * 5 + px) * 2;
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(cx, cy + 20, 16, 6, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = ITEMCOL[it]; ctx.beginPath(); ctx.arc(cx, cy + bob, 19, 0, 7); ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.stroke();
+  ctx.fillStyle = '#0b1118'; ctx.font = 'bold 22px ' + STACK_FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(it, cx, cy + bob + 1);
+}
+function drawBomb(b) {
+  var px = b.x * T, py = HUD + b.y * T, cx = px + T / 2, cy = py + T / 2 + 3;
+  var fast = b.t < 0.8, s = 1 + 0.07 * Math.sin(time * (fast ? 24 : 9));
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(cx, cy + 20, 20, 7, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = fast && Math.floor(time * 14) % 2 ? '#7a1f1f' : '#141a22';
+  ctx.beginPath(); ctx.arc(cx, cy, 21 * s, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.beginPath(); ctx.arc(cx - 7, cy - 8, 5, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#c9b48a'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(cx + 8, cy - 17 * s); ctx.quadraticCurveTo(cx + 15, cy - 27, cx + 9, cy - 31); ctx.stroke();
+  ctx.fillStyle = Math.floor(time * 20) % 2 ? '#ffd23f' : '#ff8a1f';
+  ctx.beginPath(); ctx.arc(cx + 9, cy - 32, 5, 0, 7); ctx.fill();
+}
+function drawFlame(f) {
+  var px = f.x * T, py = HUD + f.y * T, k = Math.min(1, f.t / (FLAME_T * 0.6)), m = (1 - k) * 8;
+  ctx.fillStyle = '#ff6a1a'; rr(px + 4 + m, py + 4 + m, T - 8 - 2 * m, T - 8 - 2 * m, 14); ctx.fill();
+  ctx.fillStyle = '#ffc233'; rr(px + 14 + m, py + 14 + m, T - 28 - 2 * m, T - 28 - 2 * m, 10); ctx.fill();
+  ctx.fillStyle = '#fff6c8'; rr(px + 24 + m, py + 24 + m, T - 48 - 2 * m, T - 48 - 2 * m, 6); ctx.fill();
+}
+function drawPlayer(p) {
+  var cx = (p.x + 0.5) * T, cy = HUD + (p.y + 0.5) * T, moving = !!p.mv, bob = moving ? Math.sin(time * 20) * 2.5 : 0;
+  ctx.fillStyle = 'rgba(0,0,0,.4)'; ctx.beginPath(); ctx.ellipse(cx, cy + 24, 20, 7, 0, 0, 7); ctx.fill();
+  var st = moving ? Math.sin(time * 20) * 5 : 0;
+  ctx.fillStyle = '#17202b';
+  ctx.beginPath(); ctx.ellipse(cx - 10 + st, cy + 22, 8, 5, 0, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(cx + 10 - st, cy + 22, 8, 5, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(cx, cy + 4 + bob, 22, 0, 7); ctx.fill();
+  ctx.fillStyle = p.light; ctx.beginPath(); ctx.arc(cx - 7, cy - 2 + bob, 7, 0, 7); ctx.fill();
+  var ox = p.face === 'l' ? -4 : p.face === 'r' ? 4 : 0, oy = p.face === 'u' ? -5 : p.face === 'd' ? 3 : 0;
+  ctx.fillStyle = '#f5f9ff'; rr(cx - 14 + ox, cy - 8 + oy + bob, 28, 16, 7); ctx.fill();
+  if (p.face !== 'u') {
+    ctx.fillStyle = '#0b1118';
+    ctx.beginPath(); ctx.arc(cx - 5 + ox, cy + oy + bob, 3, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + 5 + ox, cy + oy + bob, 3, 0, 7); ctx.fill();
+  }
+  ctx.strokeStyle = p.color; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(cx, cy - 18 + bob); ctx.lineTo(cx, cy - 28 + bob); ctx.stroke();
+  ctx.fillStyle = p.light; ctx.beginPath(); ctx.arc(cx, cy - 30 + bob, 5, 0, 7); ctx.fill();
+}
+function text(s, x, y, size, color, align, weight) {
+  ctx.font = (weight || 'bold') + ' ' + size + 'px ' + STACK_FONT; ctx.fillStyle = color; ctx.textAlign = align || 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(s, x, y);
+}
+function drawHud() {
+  ctx.fillStyle = '#101923'; ctx.fillRect(0, 0, LW, HUD);
+  ctx.fillStyle = '#1e2c3b'; ctx.fillRect(0, HUD - 3, LW, 3);
+  players.forEach(function (p, i) {
+    var left = i === 0, x0 = left ? 18 : LW - 18, al = left ? 'left' : 'right';
+    ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(left ? x0 + 11 : x0 - 11, 24, 11, 0, 7); ctx.fill();
+    text(pname(i), left ? x0 + 30 : x0 - 30, 31, 22, '#e8eef6', al);
+    for (var w = 0; w < WIN_TARGET; w++) {
+      var px = left ? x0 + 7 + w * 22 : x0 - 7 - w * 22;
+      ctx.beginPath(); ctx.arc(px, 54, 7, 0, 7);
+      if (w < p.wins) { ctx.fillStyle = '#ffd23f'; ctx.fill(); } else { ctx.strokeStyle = '#4b5b70'; ctx.lineWidth = 2; ctx.stroke(); }
+    }
+    var lvl = Math.max(1, Math.round((p.speed - 4.5) / 0.9) + 1);
+    text('B ' + p.maxBombs + '   D ' + p.range + '   R ' + lvl, left ? x0 + WIN_TARGET * 22 + 14 : x0 - WIN_TARGET * 22 - 14, 60, 17, '#8ea0b5', al, '600');
+  });
+  var warn = roundTime > SUDDEN_AT - 3 && state === 'play';
+  var sec = Math.floor(roundTime), mm = Math.floor(sec / 60), ss = ('0' + (sec % 60)).slice(-2);
+  text(warn ? 'ZDI SE STAHUJÍ' : mm + ':' + ss, LW / 2, 44, warn ? 24 : 28, warn ? '#ff6a6a' : '#e8eef6', 'center');
+  if (muted) text('ZVUK VYP (Z)', LW / 2, 64, 14, '#8ea0b5', 'center', '600');
+}
+function overlay(lines) {
+  ctx.fillStyle = 'rgba(6,10,15,.82)'; ctx.fillRect(0, HUD, LW, LH - HUD);
+  lines.forEach(function (l) { text(l[0], LW / 2, HUD + l[1], l[2], l[3] || '#e8eef6', 'center', l[4]); });
+}
+function draw() {
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
+  ctx.clearRect(0, 0, LW, LH);
+  if (!grid) return;
+  var x, y;
+  for (y = 0; y < ROWS; y++) for (x = 0; x < COLS; x++) {
+    var px = x * T, py = HUD + y * T;
+    ctx.fillStyle = (x + y) % 2 ? '#1c2a37' : '#203040'; ctx.fillRect(px, py, T, T);
+    if (grid[y][x] === 1) drawWall(px, py);
+    else if (grid[y][x] === 2) drawBrick(px, py);
+    else if (items[y][x]) drawItem(px, py, items[y][x]);
+  }
+  bombs.forEach(drawBomb);
+  flames.forEach(drawFlame);
+  players.slice().sort(function (a, b) { return a.y - b.y; }).forEach(function (p) { if (p.alive) drawPlayer(p); });
+  drawHud();
+  if (state === 'play' && intro > 0) {
+    var n = Math.ceil(intro / 0.6);
+    text(n > 0 ? String(n) : '', LW / 2, HUD + ROWS * T / 2 + 40, 120, 'rgba(255,255,255,.9)', 'center');
+  }
+  if (state === 'menu') {
+    var np = pads().length;
+    ctx.fillStyle = 'rgba(6,10,15,.88)'; ctx.fillRect(0, HUD, LW, LH - HUD);
+    text('BOMBÍCI', LW / 2, HUD + 130, 84, '#ffd23f', 'center');
+    text(menuStage === 0 ? 'Pokládej bomby, rozbíjej cihly a vyhoď soupeře do vzduchu.' : 'Vyber obtížnost soupeře', LW / 2, HUD + 180, 24, '#c7d3e3', 'center', '600');
+    var menuItems = menuStage === 0
+      ? [['Hra proti počítači', '1 hráč'], ['Hra dvou hráčů', 'multiplayer']]
+      : [['Lehká', 'pomalý a opatrný soupeř'], ['Střední', 'vyvážený soupeř'], ['Těžká', 'rychlý a útočný soupeř'], ['Zpět', '']];
+    for (var mi = 0; mi < menuItems.length; mi++) {
+      var rc = menuRect(mi), by = HUD + rc.y, on = menuSel === mi, small = rc.h < 70;
+      ctx.fillStyle = on ? '#ffd23f' : '#1b2735'; rr(LW / 2 - 280, by, 560, rc.h, 16); ctx.fill();
+      if (!on) { ctx.strokeStyle = '#33475f'; ctx.lineWidth = 2; ctx.stroke(); }
+      if (small) { text('‹ ' + menuItems[mi][0], LW / 2, by + 36, 24, on ? '#0b1118' : '#e8eef6', 'center'); }
+      else {
+        text(menuItems[mi][0], LW / 2, by + 36, 32, on ? '#0b1118' : '#e8eef6', 'center');
+        text(menuItems[mi][1], LW / 2, by + 62, 18, on ? '#3a3417' : '#8ea0b5', 'center', '600');
+      }
+    }
+    if (menuStage === 0) {
+      if (menuSel === 0) {
+        text('Ty (modrý): W A S D nebo šipky · bomba mezerník nebo Enter · nebo gamepad', LW / 2, HUD + 470, 22, '#35c8ff', 'center', '600');
+        text('Soupeř (červený): počítač', LW / 2, HUD + 504, 22, '#ff5d73', 'center', '600');
+      } else {
+        text('Hráč 1 (modrý): W A S D · bomba mezerník · nebo gamepad 1', LW / 2, HUD + 470, 22, '#35c8ff', 'center', '600');
+        text('Hráč 2 (červený): šipky · bomba Enter · nebo gamepad 2 / ovladač TV', LW / 2, HUD + 504, 22, '#ff5d73', 'center', '600');
+      }
+      text('Bonusy:  B více bomb   D delší výbuch   R rychlost   ·   první na ' + WIN_TARGET + ' výhry', LW / 2, HUD + 552, 20, '#c7d3e3', 'center', '600');
+    }
+    text('Nahoru / dolů: výběr  ·  Enter nebo tlačítko: potvrdit', LW / 2, HUD + 628, 28, '#ffd23f', 'center');
+    text('Z: zvuk ' + (muted ? 'vypnutý' : 'zapnutý') + '  ·  F: celá obrazovka  ·  gamepady: ' + np, LW / 2, HUD + 692, 18, '#8ea0b5', 'center', '600');
+  } else if (state === 'round' || state === 'match') {
+    var who = lastWinner ? pnameShort(lastWinner.id) : null;
+    overlay([
+      [state === 'match' ? who + ' vyhrál zápas!' : (who ? 'Kolo vyhrává ' + who : 'Remíza'), 330, 64, lastWinner ? lastWinner.color : '#e8eef6'],
+      ['Skóre  ' + players[0].wins + ' : ' + players[1].wins, 400, 40, '#e8eef6'],
+      [state === 'match' ? 'Enter nebo tlačítko: zpět do menu' : 'Enter nebo tlačítko: další kolo', 500, 28, '#ffd23f']
+    ]);
+  }
+}
+
+/* ---------- loop ---------- */
+var last = performance.now();
+var msgEl = document.getElementById('msg');
+function frame(now) {
+  if (msgEl) { msgEl.parentNode.removeChild(msgEl); msgEl = null; }
+  var dt = Math.min(0.05, (now - last) / 1000); last = now;
+  readInput(); update(dt); draw();
+  requestAnimationFrame(frame);
+}
+fit(); newRound(); intro = 0; state = 'menu';
+window.__dbg = function () { return { state: state, players: players, bombs: bombs.length, flames: flames.length, grid: grid, mode: mode, muted: muted, diff: diff, stage: menuStage, sel: menuSel }; };
+try { cv.focus(); } catch (e) {}
+requestAnimationFrame(frame);
+})();
+</script>
+<a href="../index.html" style="position:fixed;right:8px;top:8px;z-index:99;background:rgba(0,0,0,.55);color:#fff;font:13px Arial;padding:6px 10px;border-radius:10px;text-decoration:none;opacity:.7">☰ Menu</a></body></html>

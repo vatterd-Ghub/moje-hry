@@ -1,0 +1,8 @@
+Jak z tohoto projektu dostat APK (bez Android Studia)
+1. Na github.com si vytvoř účet (zdarma) a nový repozitář, např. "moje-hry" (Public je nejjednodušší).
+2. V repozitáři dej Add file > Upload files a přetáhni VŠECHNO z této složky (včetně skryté složky .github).
+   Pokud se .github nenahraje: Add file > Create new file, napiš název  .github/workflows/build.yml  a vlož obsah souboru build.yml.
+3. Záložka Actions: po nahrání se spustí "Sestavit APK" (trvá cca 5 minut).
+4. Hotové APK najdeš vpravo na hlavní stránce repozitáře v "Releases" (soubor moje-hry.apk).
+5. Na TV: otevři v prohlížeči adresu releasu a stáhni APK, nebo ho pošli aplikací "Send files to TV" / USB flashkou.
+   V TV povol instalaci z neznámých zdrojů (Nastavení > Soukromí/Zabezpečení) a APK otevři.
