@@ -442,7 +442,8 @@ cv.addEventListener('pointerdown', function (ev) {
 });
 
 function pads() {
-  var out = [];
+  var out = [], np = window.__np || [], k;
+  for (k = 0; k < np.length; k++) if (np[k] && np[k].connected) out.push(np[k]);
   try { var l = navigator.getGamepads ? navigator.getGamepads() : []; for (var i = 0; i < l.length; i++) if (l[i] && l[i].connected && !/consumer control|touchpad|keyboard|mouse|remote|system control/i.test(l[i].id || '')) out.push(l[i]); } catch (e) {}
   return out;
 }

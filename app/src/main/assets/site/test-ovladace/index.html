@@ -22,7 +22,7 @@ document.addEventListener('keydown',function(e){nKey++;$('kb').innerHTML='Kláve
 document.addEventListener('mousemove',function(e){nMouse++;$('ms').innerHTML='Myš: pohyb '+nMouse+'× · x='+e.clientX+' y='+e.clientY});
 document.addEventListener('mousedown',function(e){$('ms').innerHTML+=' · klik (tlačítko '+e.button+')'});
 function poll(){
-  var l=[];try{l=navigator.getGamepads?navigator.getGamepads():[]}catch(e){}
+  var l=[],np=window.__np||[],q;try{l=Array.prototype.slice.call(navigator.getGamepads?navigator.getGamepads():[])}catch(e){}for(q=0;q<np.length;q++)if(np[q]&&np[q].connected)l.push(np[q]);
   var t='',found=0;
   for(var i=0;i<l.length;i++){var g=l[i];if(!g)continue;found++;
     var b=[],a=[];for(var j=0;j<g.buttons.length;j++)if(g.buttons[j].pressed)b.push(j);

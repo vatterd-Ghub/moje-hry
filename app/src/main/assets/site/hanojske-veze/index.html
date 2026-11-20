@@ -46,7 +46,7 @@ button.o{background:linear-gradient(180deg,#ffa63d,#e5781a);box-shadow:0 3px 0 #
       <button id="bPlus">+ kroužek</button>
       <button id="bSnd">Zvuk: zap</button>
     </div>
-    <div class="hint">Klikni na věž (nebo ← → a Enter/mezerník): zvedneš horní kroužek a pak ho položíš na jinou věž. Větší kroužek nikdy nesmí na menší. Přesuň všechny na jinou věž. Myší otáčej scénou, kolečkem přibližuj. Z = zvuk, U = zpět, R = nová hra, H = řešení, PgUp/PgDn = počet kroužků.</div>
+    <div class="hint">Klikni na věž (nebo ← → a Enter/mezerník): zvedneš horní kroužek a pak ho položíš na jinou věž. Větší kroužek nikdy nesmí na menší. Přesuň všechny na jinou věž. Myší otáčej scénou, kolečkem přibližuj. Z = zvuk, U = zpět, R = nová hra, H = řešení, PgUp/PgDn = počet kroužků. Gamepad: ←/→ výběr věže, A zvednout/položit, B zpět, X nová hra, Y řešení, L1/R1 počet kroužků, SELECT = menu.</div>
   </div>
   <div id="win"><div class="card"><h2>🎉 Hotovo!</h2><p id="winTxt"></p><button id="bAgain" class="g">Hrát znovu (Enter)</button></div></div>
   <div id="msg"></div>
@@ -362,12 +362,29 @@ $('bSnd').onclick=function(){setSound(!sound)};
 $('bAgain').onclick=function(){newGame()};
 [ 'bNew','bUndo','bSolve','bPlus','bMinus','bSnd','bAgain' ].forEach(function(id){$(id).addEventListener('keydown',function(e){e.stopPropagation&&0})});
 
+var padPrev={};
+function padList(){var out=[],np=window.__np||[],k,l;
+ for(k=0;k<np.length;k++)if(np[k]&&np[k].connected)out.push(np[k]);
+ try{l=navigator.getGamepads?navigator.getGamepads():[];for(k=0;k<l.length;k++)if(l[k]&&l[k].connected&&!/consumer control|touchpad|keyboard|mouse|remote|system control/i.test(l[k].id||''))out.push(l[k])}catch(e){}
+ return out}
+function padAct(k){
+ if(solving){newGame();return}
+ if(won){if(k==='a'||k==='x')newGame();return}
+ if(k==='l')setCursor(cursor-1);else if(k==='r')setCursor(cursor+1);
+ else if(k==='a')selectPeg(cursor);else if(k==='b')undo();else if(k==='x')newGame();else if(k==='y')solve();
+ else if(k==='p')newGame(n+1);else if(k==='m')newGame(n-1)}
+function padPoll(){
+ var g=padList()[0];if(!g)return;
+ var b=g.buttons,ax=g.axes[0]||0;
+ function pr(i){return !!(b[i]&&b[i].pressed)}
+ var now={l:ax<-0.5||pr(14),r:ax>0.5||pr(15),a:pr(0),b:pr(1),x:pr(2),y:pr(3),p:pr(5),m:pr(4)};
+ for(var k in now){if(now[k]&&!padPrev[k])padAct(k);padPrev[k]=now[k]}}
 // loop
 var last=performance.now();
 function frame(now){
   requestAnimationFrame(frame);
   var dt=Math.min(0.05,(now-last)/1000);last=now;
-  stepTweens(now);stepConf(dt);
+  padPoll();stepTweens(now);stepConf(dt);
   if(held&&discs[held])discs[held].rotation.y+=dt*2.5;
   if(won&&!solving){for(var id in discs)discs[id].rotation.y+=dt*(1+id*0.3)}
   ring.scale.setScalar(1+Math.sin(now/260)*0.04);
